@@ -1,5 +1,6 @@
 #include "server.hpp"
 
+#include "connection.hpp"
 #include "http_types.hpp"
 #include "request_parser.hpp"
 
@@ -9,12 +10,14 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace {
 
@@ -92,7 +95,8 @@ bool write_all(int fd, std::string_view data) {
     return true;
 }
 
-void handle_connection(int fd, const std::string& docroot) {
+void handle_connection(Connection conn, const std::string& docroot) {
+    const int fd = conn.fd();
     std::string buf;
     char chunk[8192];
     while (true) {
@@ -155,6 +159,7 @@ void run_server(int port, const std::string& docroot) {
     }
 
     std::printf("listening on :%d (docroot %s)\n", port, docroot.c_str());
+    std::signal(SIGPIPE, SIG_IGN);
 
     while (true) {
         int conn_fd = ::accept(listen_fd, nullptr, nullptr);
@@ -163,7 +168,8 @@ void run_server(int port, const std::string& docroot) {
             std::perror("accept");
             continue;
         }
-        handle_connection(conn_fd, docroot);
-        ::close(conn_fd);
+        std::thread([conn_fd, &docroot] {
+            handle_connection(Connection{conn_fd}, docroot);
+        }).detach();
     }
 }
