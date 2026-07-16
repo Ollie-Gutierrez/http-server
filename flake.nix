@@ -6,12 +6,12 @@
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
     in {
-      devShells.${system}.default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
+      devShells.${system}.default = pkgs.mkShell.override { stdenv = pkgs.libcxxStdenv; } {
         packages = with pkgs; [
           cmake
           ninja
           pkg-config
-          gtest
+          (gtest.override { stdenv = pkgs.libcxxStdenv; })
           wrk
           perf
           curl
