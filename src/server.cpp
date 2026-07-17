@@ -20,6 +20,7 @@
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -211,15 +212,16 @@ void handle_conn_event(int epfd, int fd, std::uint32_t events, const std::string
 
 }  // namespace
 
-void run_server(int port, const std::string& docroot) {
+int make_listener(int port) {
     int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         std::perror("socket");
-        return;
+        return -1;
     }
 
     int yes = 1;
     ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
     set_nonblocking(listen_fd);
 
     sockaddr_in addr{};
@@ -229,13 +231,19 @@ void run_server(int port, const std::string& docroot) {
 
     if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::perror("bind");
-        return;
+        return -1;
     }
     if (::listen(listen_fd, SOMAXCONN) < 0) {
         std::perror("listen");
-        return;
+        return -1;
     }
+    return listen_fd;
+}
 
+// One listener plus one epoll loop per thread. Every worker accepts on
+// its own SO_REUSEPORT socket, so the kernel spreads incoming connections
+// over them and no connection is ever touched by two threads.
+void worker_loop(int listen_fd, const std::string& docroot) {
     int epfd = ::epoll_create1(0);
     if (epfd < 0) {
         std::perror("epoll_create1");
@@ -246,9 +254,6 @@ void run_server(int port, const std::string& docroot) {
     ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = listen_fd;
     ::epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
-
-    std::printf("listening on :%d (docroot %s)\n", port, docroot.c_str());
-    std::signal(SIGPIPE, SIG_IGN);
 
     std::unordered_map<int, Session> sessions;
     std::vector<epoll_event> events(kMaxEvents);
@@ -269,4 +274,23 @@ void run_server(int port, const std::string& docroot) {
             }
         }
     }
+}
+
+void run_server(int port, const std::string& docroot) {
+    std::signal(SIGPIPE, SIG_IGN);
+
+    unsigned n = std::thread::hardware_concurrency();
+    if (n == 0) n = 1;
+    std::printf("listening on :%d (docroot %s), %u worker thread%s\n", port, docroot.c_str(), n,
+                n == 1 ? "" : "s");
+
+    std::vector<std::jthread> workers;
+    for (unsigned i = 1; i < n; ++i) {
+        int fd = make_listener(port);
+        if (fd < 0) return;
+        workers.emplace_back(worker_loop, fd, docroot);
+    }
+    int fd = make_listener(port);
+    if (fd < 0) return;
+    worker_loop(fd, docroot);
 }

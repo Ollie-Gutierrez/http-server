@@ -10,6 +10,7 @@ Small HTTP/1.1 server in C++ for Linux.
 | keep-alive | 87k | 86k |
 | one thread per connection | 87k | 416k |
 | epoll, single thread | 81k | 213k |
+| epoll, one loop per core | 80k | 410k |
 
 Measured with wrk over loopback, 10 second runs.
 
