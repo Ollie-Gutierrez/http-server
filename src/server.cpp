@@ -96,6 +96,7 @@ HttpResponse handle_request(const HttpRequest& req, const std::string& docroot) 
 struct Session {
     Connection conn;
     std::string read_buf;
+    std::size_t read_pos = 0;  // bytes of read_buf already parsed
     std::string write_buf;
     std::size_t write_pos = 0;
     bool want_close = false;
@@ -149,7 +150,7 @@ bool process_reads(int epfd, int fd, Session& s, const std::string& docroot) {
         s.read_buf.append(chunk, static_cast<std::size_t>(n));
 
         while (!s.want_close) {
-            ParseResult pr = parse_request(s.read_buf);
+            ParseResult pr = parse_request(std::string_view(s.read_buf).substr(s.read_pos));
             if (!pr.complete) break;
 
             HttpResponse resp;
@@ -165,8 +166,13 @@ bool process_reads(int epfd, int fd, Session& s, const std::string& docroot) {
                 resp = handle_request(pr.request, docroot);
             }
             s.write_buf += resp.serialize(keep_alive);
-            s.read_buf.erase(0, pr.consumed);
+            s.read_pos += pr.consumed;
             if (!keep_alive) s.want_close = true;
+        }
+        // buffer fully parsed: take it back without a memmove
+        if (s.read_pos == s.read_buf.size()) {
+            s.read_buf.clear();
+            s.read_pos = 0;
         }
     }
     return finish(epfd, fd, s);
