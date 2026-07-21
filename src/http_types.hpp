@@ -1,31 +1,73 @@
 #pragma once
 
-#include <algorithm>
-#include <cctype>
+#include <array>
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 namespace http {
 
-inline std::string to_lower(std::string_view s) {
-    std::string out(s);
-    std::ranges::transform(out, out.begin(), [](unsigned char c) { return std::tolower(c); });
-    return out;
+inline char ascii_lower(char c) {
+    return 'A' <= c && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+inline bool iequals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (ascii_lower(a[i]) != ascii_lower(b[i])) return false;
+    }
+    return true;
+}
+
+inline bool icontains(std::string_view hay, std::string_view needle) {
+    if (needle.empty()) return true;
+    for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+        if (iequals(hay.substr(i, needle.size()), needle)) return true;
+    }
+    return false;
 }
 
 }  // namespace http
 
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::unordered_map<std::string, std::string> headers;
-    std::string body;
+struct HeaderField {
+    std::string_view name;
+    std::string_view value;
+};
 
-    std::string_view header(std::string_view key) const {
-        auto it = headers.find(http::to_lower(key));
-        return it == headers.end() ? std::string_view{} : std::string_view{it->second};
+// views into the read buffer; lines past kMax dropped
+class HeaderList {
+public:
+    static constexpr std::size_t kMax = 32;
+
+    void emplace(std::string_view name, std::string_view value) {
+        if (n_ < kMax) items_[n_++] = HeaderField{name, value};
     }
+
+    std::string_view find(std::string_view name) const {
+        for (std::size_t i = 0; i < n_; ++i) {
+            if (http::iequals(items_[i].name, name)) return items_[i].value;
+        }
+        return {};
+    }
+
+    std::size_t size() const noexcept { return n_; }
+    const HeaderField* begin() const noexcept { return items_.data(); }
+    const HeaderField* end() const noexcept { return items_.data() + n_; }
+
+private:
+    std::array<HeaderField, kMax> items_;
+    std::size_t n_ = 0;
+};
+
+struct HttpRequest {
+    std::string_view method;
+    std::string_view path;
+    HeaderList headers;
+    std::string body;  // only non-empty when a body was sent
+
+    std::string_view header(std::string_view key) const { return headers.find(key); }
 };
 
 struct HttpResponse {

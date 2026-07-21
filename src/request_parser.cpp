@@ -34,8 +34,8 @@ ParseResult parse_request(std::string_view buf) {
         r.consumed = header_block_len;
         return r;
     }
-    r.request.method = std::string(request_line.substr(0, sp1));
-    r.request.path = std::string(request_line.substr(sp1 + 1, sp2 - sp1 - 1));
+    r.request.method = request_line.substr(0, sp1);
+    r.request.path = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
 
     std::size_t pos = eol == std::string_view::npos ? head.size() : eol + 2;
     while (pos < head.size()) {
@@ -51,9 +51,7 @@ ParseResult parse_request(std::string_view buf) {
             r.consumed = header_block_len;
             return r;
         }
-        std::string key = http::to_lower(trim(line.substr(0, colon)));
-        std::string val = std::string(trim(line.substr(colon + 1)));
-        r.request.headers.emplace(std::move(key), std::move(val));
+        r.request.headers.emplace(trim(line.substr(0, colon)), trim(line.substr(colon + 1)));
 
         if (next == std::string_view::npos) break;
         pos = next + 2;

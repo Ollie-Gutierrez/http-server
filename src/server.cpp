@@ -162,7 +162,7 @@ bool process_reads(int epfd, int fd, Session& s, const std::string& docroot) {
                 resp.body = "400 bad request";
                 keep_alive = false;
             } else {
-                keep_alive = !http::to_lower(pr.request.header("connection")).contains("close");
+                keep_alive = !http::icontains(pr.request.header("connection"), "close");
                 resp = handle_request(pr.request, docroot);
             }
             s.write_buf += resp.serialize(keep_alive);
