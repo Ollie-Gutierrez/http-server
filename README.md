@@ -11,6 +11,7 @@ Small HTTP/1.1 server in C++ for Linux.
 | one thread per connection | 87k | 416k |
 | epoll, single thread | 81k | 213k |
 | epoll, one loop per core | 80k | 410k |
+| faster parsing and response building | 81k | 405k |
 
 Measured with wrk over loopback, 10 second runs.
 

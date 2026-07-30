@@ -51,7 +51,6 @@ std::string_view content_type_for(std::string_view path) {
 
 HttpResponse handle_request(const HttpRequest& req, const std::string& docroot) {
     HttpResponse resp;
-    resp.headers["Content-Type"] = "text/plain";
 
     if (req.method != "GET") {
         resp.status = 405;
@@ -88,7 +87,7 @@ HttpResponse handle_request(const HttpRequest& req, const std::string& docroot) 
     std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     resp.status = 200;
     resp.reason = "OK";
-    resp.headers["Content-Type"] = std::string(content_type_for(fp.string()));
+    resp.content_type = std::string(content_type_for(fp.string()));
     resp.body = std::move(body);
     return resp;
 }
@@ -158,14 +157,13 @@ bool process_reads(int epfd, int fd, Session& s, const std::string& docroot) {
             if (pr.malformed) {
                 resp.status = 400;
                 resp.reason = "Bad Request";
-                resp.headers["Content-Type"] = "text/plain";
                 resp.body = "400 bad request";
                 keep_alive = false;
             } else {
                 keep_alive = !http::icontains(pr.request.header("connection"), "close");
                 resp = handle_request(pr.request, docroot);
             }
-            s.write_buf += resp.serialize(keep_alive);
+            resp.serialize_into(s.write_buf, keep_alive);
             s.read_pos += pr.consumed;
             if (!keep_alive) s.want_close = true;
         }

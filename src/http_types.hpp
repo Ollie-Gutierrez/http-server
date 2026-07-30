@@ -1,10 +1,10 @@
 #pragma once
 
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 
 namespace http {
@@ -73,29 +73,27 @@ struct HttpRequest {
 struct HttpResponse {
     int status = 200;
     std::string reason = "OK";
-    std::unordered_map<std::string, std::string> headers;
+    std::string content_type = "text/plain";
     std::string body;
 
-    std::string serialize(bool keep_alive) const {
-        std::string s;
-        s.reserve(256 + body.size());
-        s += "HTTP/1.1 ";
-        s += std::to_string(status);
-        s += ' ';
-        s += reason;
-        s += "\r\n";
-        for (const auto& [k, v] : headers) {
-            s += k;
-            s += ": ";
-            s += v;
-            s += "\r\n";
-        }
-        s += "Content-Length: ";
-        s += std::to_string(body.size());
-        s += "\r\nConnection: ";
-        s += keep_alive ? "keep-alive" : "close";
-        s += "\r\n\r\n";
-        s += body;
-        return s;
+    void serialize_into(std::string& out, bool keep_alive) const {
+        char status_buf[16];
+        char length_buf[16];
+        auto st = std::to_chars(status_buf, status_buf + sizeof status_buf, status);
+        auto ln = std::to_chars(length_buf, length_buf + sizeof length_buf, body.size());
+
+        out.reserve(out.size() + 160 + content_type.size() + body.size());
+        out += "HTTP/1.1 ";
+        out.append(status_buf, st.ptr);
+        out += ' ';
+        out += reason;
+        out += "\r\nContent-Type: ";
+        out += content_type;
+        out += "\r\nContent-Length: ";
+        out.append(length_buf, ln.ptr);
+        out += "\r\nConnection: ";
+        out += keep_alive ? "keep-alive" : "close";
+        out += "\r\n\r\n";
+        out += body;
     }
 };
