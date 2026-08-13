@@ -4,20 +4,20 @@
 #include "http_types.hpp"
 #include "request_parser.hpp"
 
+#include <liburing.h>
+
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <netinet/in.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -26,13 +26,9 @@
 
 namespace {
 
-constexpr int kMaxEvents = 128;
-constexpr std::size_t kReadChunk = 8192;
-
-void set_nonblocking(int fd) {
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
+constexpr unsigned kRingDepth = 512;
+constexpr std::size_t kReadChunk = 4096;
+constexpr std::size_t kMaxReadBuf = 64 * 1024;  // unparseable garbage cap
 
 std::string_view content_type_for(std::string_view path) {
     auto dot = path.rfind('.');
@@ -59,7 +55,7 @@ HttpResponse handle_request(const HttpRequest& req, const std::string& docroot) 
         return resp;
     }
 
-    if (req.path.find("..") != std::string::npos) {
+    if (req.path.find("..") != std::string_view::npos) {
         resp.status = 400;
         resp.reason = "Bad Request";
         resp.body = "400 bad request";
@@ -92,68 +88,148 @@ HttpResponse handle_request(const HttpRequest& req, const std::string& docroot) 
     return resp;
 }
 
+// low bits of user_data carry the op; Session* keeps those bits zero
+enum class Op : std::uintptr_t { Accept = 0, Read = 1, Write = 2, Close = 3 };
+
+struct Session;
+
+std::uintptr_t tag(Session* s, Op op) {
+    return reinterpret_cast<std::uintptr_t>(s) | static_cast<std::uintptr_t>(op);
+}
+
 struct Session {
     Connection conn;
+    int fd_no;  // map key, stays valid after conn.release()
     std::string read_buf;
-    std::size_t read_pos = 0;  // bytes of read_buf already parsed
     std::string write_buf;
     std::size_t write_pos = 0;
     bool want_close = false;
 };
 
-bool has_pending_writes(const Session& s) { return s.write_pos < s.write_buf.size(); }
-
-void arm(int epfd, int fd, std::uint32_t events) {
-    epoll_event ev{};
-    ev.events = events;
-    ev.data.fd = fd;
-    ::epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
-}
-
-bool flush(int fd, Session& s) {
-    while (has_pending_writes(s)) {
-        ssize_t n = ::write(fd, s.write_buf.data() + s.write_pos, s.write_buf.size() - s.write_pos);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-            if (errno == EINTR) continue;
-            return false;
+// one ring per thread; unique_ptr sessions keep user_data pointers valid
+// while ops are in flight
+class Worker {
+public:
+    Worker(int listen_fd, const std::string& docroot) : listen_fd_(listen_fd), docroot_(docroot) {
+        if (io_uring_queue_init(kRingDepth, &ring_, 0) < 0) {
+            std::perror("io_uring_queue_init");
+            std::exit(1);
         }
-        s.write_pos += static_cast<std::size_t>(n);
     }
-    s.write_buf.clear();
-    s.write_pos = 0;
-    return true;
-}
 
-bool finish(int epfd, int fd, Session& s) {
-    if (!flush(fd, s)) return false;
-    std::uint32_t events = EPOLLIN | EPOLLET;
-    if (has_pending_writes(s)) events |= EPOLLOUT;
-    arm(epfd, fd, events);
-    return !(s.want_close && !has_pending_writes(s));
-}
+    ~Worker() { io_uring_queue_exit(&ring_); }
 
-bool process_reads(int epfd, int fd, Session& s, const std::string& docroot) {
-    char chunk[kReadChunk];
-    while (true) {
-        ssize_t n = ::read(fd, chunk, sizeof(chunk));
+    void run() {
+        submit_accept();
+        while (true) {
+            io_uring_submit_and_wait(&ring_, 1);
+
+            io_uring_cqe* cqe;
+            unsigned head;
+            unsigned count = 0;
+            io_uring_for_each_cqe(&ring_, head, cqe) {
+                handle(cqe);
+                ++count;
+            }
+            if (count > 0) io_uring_cq_advance(&ring_, count);
+        }
+    }
+
+private:
+    // the SQ can fill mid-batch under a completion storm; flush and retry once
+    io_uring_sqe* get_sqe() {
+        io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (!sqe) {
+            io_uring_submit(&ring_);
+            sqe = io_uring_get_sqe(&ring_);
+        }
+        return sqe;
+    }
+
+    void submit_accept() {
+        io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_accept(sqe, listen_fd_, nullptr, nullptr, 0);
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(nullptr, Op::Accept)));
+    }
+
+    void submit_read(Session& s) {
+        std::size_t have = s.read_buf.size();
+        s.read_buf.resize(have + kReadChunk);
+        io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_read(sqe, s.conn.fd(), s.read_buf.data() + have, kReadChunk, 0);
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(&s, Op::Read)));
+    }
+
+    void submit_write(Session& s) {
+        io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_write(sqe, s.conn.fd(), s.write_buf.data() + s.write_pos,
+                            s.write_buf.size() - s.write_pos, 0);
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(&s, Op::Write)));
+    }
+
+    // close through the ring: the fd must not be reused while the kernel knows it
+    void submit_close(Session& s) {
+        int fd = s.conn.release();
+        io_uring_sqe* sqe = get_sqe();
+        io_uring_prep_close(sqe, fd);
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(&s, Op::Close)));
+    }
+
+    void drop(Session& s) { sessions_.erase(s.fd_no); }
+
+    void handle(const io_uring_cqe* cqe) {
+        auto bits = reinterpret_cast<std::uintptr_t>(io_uring_cqe_get_data(cqe));
+        Session* s = reinterpret_cast<Session*>(bits & ~static_cast<std::uintptr_t>(3));
+        switch (static_cast<Op>(bits & 3)) {
+            case Op::Accept:
+                on_accept(cqe->res);
+                break;
+            case Op::Read:
+                on_read(*s, cqe->res);
+                break;
+            case Op::Write:
+                on_write(*s, cqe->res);
+                break;
+            case Op::Close:
+                drop(*s);
+                break;
+        }
+    }
+
+    void on_accept(int fd) {
+        submit_accept();     // keep one accept outstanding
+        if (fd < 0) return;  // EAGAIN or error: the re-arm covers it
+
+        auto s = std::make_unique<Session>();
+        s->conn = Connection{fd};
+        s->fd_no = fd;
+        Session* raw = s.get();
+        sessions_[fd] = std::move(s);
+        submit_read(*raw);
+    }
+
+    void on_read(Session& s, int n) {
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            if (errno == EINTR) continue;
-            return false;
+            drop(s);
+            return;
         }
-        if (n == 0) {
+        if (n == 0) {  // peer closed; flush anything owed, then close
             s.want_close = true;
-            break;
+            if (!s.write_buf.empty()) {
+                submit_write(s);
+            } else {
+                submit_close(s);
+            }
+            return;
         }
-        s.read_buf.append(chunk, static_cast<std::size_t>(n));
+        s.read_buf.resize(s.read_buf.size() - (kReadChunk - static_cast<std::size_t>(n)));
 
-        while (!s.want_close) {
-            ParseResult pr = parse_request(std::string_view(s.read_buf).substr(s.read_pos));
+        bool keep_alive = true;
+        while (true) {
+            ParseResult pr = parse_request(s.read_buf);
             if (!pr.complete) break;
 
             HttpResponse resp;
-            bool keep_alive;
             if (pr.malformed) {
                 resp.status = 400;
                 resp.reason = "Bad Request";
@@ -161,60 +237,56 @@ bool process_reads(int epfd, int fd, Session& s, const std::string& docroot) {
                 keep_alive = false;
             } else {
                 keep_alive = !http::icontains(pr.request.header("connection"), "close");
-                resp = handle_request(pr.request, docroot);
+                resp = handle_request(pr.request, docroot_);
             }
             resp.serialize_into(s.write_buf, keep_alive);
-            s.read_pos += pr.consumed;
-            if (!keep_alive) s.want_close = true;
+            s.read_buf.erase(0, pr.consumed);
+            if (!keep_alive) break;
         }
-        // buffer fully parsed: take it back without a memmove
-        if (s.read_pos == s.read_buf.size()) {
-            s.read_buf.clear();
-            s.read_pos = 0;
+
+        if (s.read_buf.size() > kMaxReadBuf) {
+            HttpResponse resp;
+            resp.status = 400;
+            resp.reason = "Bad Request";
+            resp.body = "400 bad request";
+            resp.serialize_into(s.write_buf, false);
+            keep_alive = false;
+        }
+
+        if (!keep_alive) s.want_close = true;
+        if (!s.write_buf.empty()) {
+            submit_write(s);
+        } else if (s.want_close) {
+            submit_close(s);
+        } else {
+            submit_read(s);
         }
     }
-    return finish(epfd, fd, s);
-}
 
-void close_session(int epfd, std::unordered_map<int, Session>& sessions, int fd) {
-    ::epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-    sessions.erase(fd);
-}
-
-void accept_all(int epfd, int listen_fd, std::unordered_map<int, Session>& sessions) {
-    while (true) {
-        int fd = ::accept(listen_fd, nullptr, nullptr);
-        if (fd < 0) {
-            if (errno == EINTR) continue;
-            break;  // EAGAIN/EWOULDBLOCK or error: done with this batch
+    void on_write(Session& s, int n) {
+        if (n <= 0) {
+            drop(s);
+            return;
         }
-        set_nonblocking(fd);
-        sessions[fd].conn = Connection{fd};
-        epoll_event ev{};
-        ev.events = EPOLLIN | EPOLLET;
-        ev.data.fd = fd;
-        ::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-    }
-}
-
-void handle_conn_event(int epfd, int fd, std::uint32_t events, const std::string& docroot,
-                       std::unordered_map<int, Session>& sessions) {
-    auto it = sessions.find(fd);
-    if (it == sessions.end()) return;
-    Session& s = it->second;
-
-    if (events & (EPOLLERR | EPOLLHUP)) {
-        close_session(epfd, sessions, fd);
-        return;
+        s.write_pos += static_cast<std::size_t>(n);
+        if (s.write_pos < s.write_buf.size()) {
+            submit_write(s);
+            return;
+        }
+        s.write_buf.clear();
+        s.write_pos = 0;
+        if (s.want_close) {
+            submit_close(s);
+        } else {
+            submit_read(s);
+        }
     }
 
-    bool alive = true;
-    if (events & EPOLLIN) alive = process_reads(epfd, fd, s, docroot);
-    if (alive && (events & EPOLLOUT)) alive = finish(epfd, fd, s);
-    if (!alive) close_session(epfd, sessions, fd);
-}
-
-}  // namespace
+    io_uring ring_{};
+    int listen_fd_;
+    const std::string& docroot_;
+    std::unordered_map<int, std::unique_ptr<Session>> sessions_;
+};
 
 int make_listener(int port) {
     int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -226,7 +298,6 @@ int make_listener(int port) {
     int yes = 1;
     ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     ::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
-    set_nonblocking(listen_fd);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -244,41 +315,7 @@ int make_listener(int port) {
     return listen_fd;
 }
 
-// One listener plus one epoll loop per thread. Every worker accepts on
-// its own SO_REUSEPORT socket, so the kernel spreads incoming connections
-// over them and no connection is ever touched by two threads.
-void worker_loop(int listen_fd, const std::string& docroot) {
-    int epfd = ::epoll_create1(0);
-    if (epfd < 0) {
-        std::perror("epoll_create1");
-        return;
-    }
-
-    epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.fd = listen_fd;
-    ::epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
-
-    std::unordered_map<int, Session> sessions;
-    std::vector<epoll_event> events(kMaxEvents);
-
-    while (true) {
-        int n = ::epoll_wait(epfd, events.data(), kMaxEvents, -1);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            std::perror("epoll_wait");
-            break;
-        }
-        for (int i = 0; i < n; ++i) {
-            int fd = events[i].data.fd;
-            if (fd == listen_fd) {
-                accept_all(epfd, listen_fd, sessions);
-            } else {
-                handle_conn_event(epfd, fd, events[i].events, docroot, sessions);
-            }
-        }
-    }
-}
+}  // namespace
 
 void run_server(int port, const std::string& docroot) {
     std::signal(SIGPIPE, SIG_IGN);
@@ -292,9 +329,9 @@ void run_server(int port, const std::string& docroot) {
     for (unsigned i = 1; i < n; ++i) {
         int fd = make_listener(port);
         if (fd < 0) return;
-        workers.emplace_back(worker_loop, fd, docroot);
+        workers.emplace_back([fd, &docroot] { Worker(fd, docroot).run(); });
     }
     int fd = make_listener(port);
     if (fd < 0) return;
-    worker_loop(fd, docroot);
+    Worker(fd, docroot).run();
 }

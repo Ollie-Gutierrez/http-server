@@ -12,6 +12,7 @@ Small HTTP/1.1 server in C++ for Linux.
 | epoll, single thread | 81k | 213k |
 | epoll, one loop per core | 80k | 410k |
 | faster parsing and response building | 81k | 405k |
+| io_uring | 82k | 412k |
 
 Measured with wrk over loopback, 10 second runs.
 
@@ -22,4 +23,4 @@ Measured with wrk over loopback, 10 second runs.
     ./build/src/http_server 8080 www
 
 Then `curl http://localhost:8080/`. Tests: `ctest --test-dir build`.
-Needs the nix dev shell (`direnv allow`).
+Needs the nix dev shell (`direnv allow`) for libc++ and liburing.

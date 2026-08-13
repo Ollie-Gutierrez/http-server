@@ -12,6 +12,7 @@
           ninja
           pkg-config
           (gtest.override { stdenv = pkgs.libcxxStdenv; })
+          liburing
           wrk
           perf
           curl
