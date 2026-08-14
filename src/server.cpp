@@ -148,7 +148,7 @@ private:
 
     void submit_accept() {
         io_uring_sqe* sqe = get_sqe();
-        io_uring_prep_accept(sqe, listen_fd_, nullptr, nullptr, 0);
+        io_uring_prep_multishot_accept(sqe, listen_fd_, nullptr, nullptr, 0);
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(nullptr, Op::Accept)));
     }
 
@@ -182,7 +182,7 @@ private:
         Session* s = reinterpret_cast<Session*>(bits & ~static_cast<std::uintptr_t>(3));
         switch (static_cast<Op>(bits & 3)) {
             case Op::Accept:
-                on_accept(cqe->res);
+                on_accept(cqe->res, cqe->flags);
                 break;
             case Op::Read:
                 on_read(*s, cqe->res);
@@ -196,9 +196,12 @@ private:
         }
     }
 
-    void on_accept(int fd) {
-        submit_accept();     // keep one accept outstanding
-        if (fd < 0) return;  // EAGAIN or error: the re-arm covers it
+    // no F_MORE means the multishot ended; re-arm only then
+    void on_accept(int fd, unsigned flags) {
+        if (fd < 0) {
+            if (!(flags & IORING_CQE_F_MORE)) submit_accept();
+            return;
+        }
 
         auto s = std::make_unique<Session>();
         s->conn = Connection{fd};
