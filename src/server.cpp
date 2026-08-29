@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <csignal>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -27,8 +28,10 @@
 namespace {
 
 constexpr unsigned kRingDepth = 512;
-constexpr std::size_t kReadChunk = 4096;
 constexpr std::size_t kMaxReadBuf = 64 * 1024;  // unparseable garbage cap
+constexpr unsigned kBufCount = 128;             // provided-buffer pool per worker
+constexpr std::size_t kBufSize = 4096;
+constexpr unsigned kBufGroupId = 0;
 
 std::string_view content_type_for(std::string_view path) {
     auto dot = path.rfind('.');
@@ -89,7 +92,7 @@ HttpResponse handle_request(const HttpRequest& req, const std::string& docroot) 
 }
 
 // low bits of user_data carry the op; Session* keeps those bits zero
-enum class Op : std::uintptr_t { Accept = 0, Read = 1, Write = 2, Close = 3 };
+enum class Op : std::uintptr_t { Accept = 0, Read = 1, Write = 2, Close = 3, Cancel = 4 };
 
 struct Session;
 
@@ -103,6 +106,8 @@ struct Session {
     std::string read_buf;
     std::string write_buf;
     std::size_t write_pos = 0;
+    bool write_in_flight = false;  // a write op holds pointers into write_buf
+    bool saw_eof = false;          // peer closed / multishot read ended
     bool want_close = false;
 };
 
@@ -115,9 +120,24 @@ public:
             std::perror("io_uring_queue_init");
             std::exit(1);
         }
+        int err = 0;
+        buf_ring_ = io_uring_setup_buf_ring(&ring_, kBufCount, kBufGroupId, 0, &err);
+        if (!buf_ring_) {
+            std::fprintf(stderr, "io_uring_setup_buf_ring: %s\n", std::strerror(err));
+            std::exit(1);
+        }
+        pool_.resize(kBufCount * kBufSize);
+        for (unsigned i = 0; i < kBufCount; ++i) {
+            io_uring_buf_ring_add(buf_ring_, &pool_[std::size_t{i} * kBufSize], kBufSize, i,
+                                  kBufCount - 1, i);
+        }
+        io_uring_buf_ring_advance(buf_ring_, kBufCount);
     }
 
-    ~Worker() { io_uring_queue_exit(&ring_); }
+    ~Worker() {
+        io_uring_free_buf_ring(&ring_, buf_ring_, kBufCount, kBufGroupId);
+        io_uring_queue_exit(&ring_);
+    }
 
     void run() {
         submit_accept();
@@ -152,11 +172,13 @@ private:
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(nullptr, Op::Accept)));
     }
 
+    // multishot recv into the shared pool: one SQE per connection for life.
+    // (READ_MULTISHOT returns EINVAL on this kernel; RECV is the socket one.)
     void submit_read(Session& s) {
-        std::size_t have = s.read_buf.size();
-        s.read_buf.resize(have + kReadChunk);
         io_uring_sqe* sqe = get_sqe();
-        io_uring_prep_read(sqe, s.conn.fd(), s.read_buf.data() + have, kReadChunk, 0);
+        io_uring_prep_recv_multishot(sqe, s.conn.fd(), nullptr, kBufSize, 0);
+        sqe->buf_group = kBufGroupId;
+        sqe->flags |= IOSQE_BUFFER_SELECT;
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(&s, Op::Read)));
     }
 
@@ -167,29 +189,36 @@ private:
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(&s, Op::Write)));
     }
 
-    // close through the ring: the fd must not be reused while the kernel knows it
+    // the read multishot must die before the session does: link a cancel in
+    // front of the close so its last cqe lands while the session is alive
     void submit_close(Session& s) {
         int fd = s.conn.release();
-        io_uring_sqe* sqe = get_sqe();
-        io_uring_prep_close(sqe, fd);
-        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(&s, Op::Close)));
+        io_uring_sqe* cancel = get_sqe();
+        io_uring_prep_cancel(cancel, reinterpret_cast<void*>(tag(&s, Op::Read)), 0);
+        io_uring_sqe_set_data(cancel, reinterpret_cast<void*>(tag(&s, Op::Cancel)));
+        cancel->flags |= IOSQE_IO_LINK;
+        io_uring_sqe* close = get_sqe();
+        io_uring_prep_close(close, fd);
+        io_uring_sqe_set_data(close, reinterpret_cast<void*>(tag(&s, Op::Close)));
     }
 
     void drop(Session& s) { sessions_.erase(s.fd_no); }
 
     void handle(const io_uring_cqe* cqe) {
         auto bits = reinterpret_cast<std::uintptr_t>(io_uring_cqe_get_data(cqe));
-        Session* s = reinterpret_cast<Session*>(bits & ~static_cast<std::uintptr_t>(3));
-        switch (static_cast<Op>(bits & 3)) {
+        Session* s = reinterpret_cast<Session*>(bits & ~static_cast<std::uintptr_t>(7));
+        switch (static_cast<Op>(bits & 7)) {
             case Op::Accept:
                 on_accept(cqe->res, cqe->flags);
                 break;
             case Op::Read:
-                on_read(*s, cqe->res);
+                on_read(*s, cqe);
                 break;
             case Op::Write:
                 on_write(*s, cqe->res);
                 break;
+            case Op::Cancel:
+                break;  // read cancellation, nothing to do
             case Op::Close:
                 drop(*s);
                 break;
@@ -211,22 +240,28 @@ private:
         submit_read(*raw);
     }
 
-    void on_read(Session& s, int n) {
-        if (n < 0) {
-            drop(s);
-            return;
-        }
-        if (n == 0) {  // peer closed; flush anything owed, then close
-            s.want_close = true;
-            if (!s.write_buf.empty()) {
-                submit_write(s);
-            } else {
-                submit_close(s);
-            }
-            return;
-        }
-        s.read_buf.resize(s.read_buf.size() - (kReadChunk - static_cast<std::size_t>(n)));
+    void return_buffer(unsigned bid) {
+        io_uring_buf_ring_add(buf_ring_, &pool_[std::size_t{bid} * kBufSize], kBufSize, bid,
+                              kBufCount - 1, 0);
+        io_uring_buf_ring_advance(buf_ring_, 1);
+    }
 
+    void on_read(Session& s, const io_uring_cqe* cqe) {
+        long n = cqe->res;
+        if (n > 0 && (cqe->flags & IORING_CQE_F_BUFFER)) {
+            unsigned bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+            s.read_buf.append(&pool_[std::size_t{bid} * kBufSize], static_cast<std::size_t>(n));
+            return_buffer(bid);
+        }
+        // no F_MORE means the multishot ended; no more reads will arrive
+        if (n <= 0 || !(cqe->flags & IORING_CQE_F_MORE)) s.saw_eof = true;
+
+        // only parse when no write is in flight: serializing could
+        // reallocate write_buf under the write op's pointers
+        if (!s.write_in_flight) process_buffered(s);
+    }
+
+    void process_buffered(Session& s) {
         bool keep_alive = true;
         while (true) {
             ParseResult pr = parse_request(s.read_buf);
@@ -256,14 +291,14 @@ private:
             keep_alive = false;
         }
 
-        if (!keep_alive) s.want_close = true;
+        if (!keep_alive || s.saw_eof) s.want_close = true;
         if (!s.write_buf.empty()) {
+            s.write_in_flight = true;
             submit_write(s);
         } else if (s.want_close) {
             submit_close(s);
-        } else {
-            submit_read(s);
         }
+        // otherwise: idle; the read multishot keeps delivering
     }
 
     void on_write(Session& s, int n) {
@@ -278,14 +313,13 @@ private:
         }
         s.write_buf.clear();
         s.write_pos = 0;
-        if (s.want_close) {
-            submit_close(s);
-        } else {
-            submit_read(s);
-        }
+        s.write_in_flight = false;
+        process_buffered(s);  // reads may have stacked up during the write
     }
 
     io_uring ring_{};
+    io_uring_buf_ring* buf_ring_ = nullptr;
+    std::vector<char> pool_;
     int listen_fd_;
     const std::string& docroot_;
     std::unordered_map<int, std::unique_ptr<Session>> sessions_;
