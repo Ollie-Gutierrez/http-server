@@ -1,6 +1,5 @@
 #include "server.hpp"
 
-#include "connection.hpp"
 #include "http_types.hpp"
 #include "request_parser.hpp"
 
@@ -28,6 +27,7 @@
 namespace {
 
 constexpr unsigned kRingDepth = 512;
+constexpr unsigned kMaxSlots = 1024;            // fixed-file table per worker
 constexpr std::size_t kMaxReadBuf = 64 * 1024;  // unparseable garbage cap
 constexpr unsigned kBufCount = 128;             // provided-buffer pool per worker
 constexpr std::size_t kBufSize = 4096;
@@ -101,8 +101,7 @@ std::uintptr_t tag(Session* s, Op op) {
 }
 
 struct Session {
-    Connection conn;
-    int fd_no;  // map key, stays valid after conn.release()
+    int slot;  // fixed-file index, also the map key
     std::string read_buf;
     std::string write_buf;
     std::size_t write_pos = 0;
@@ -116,8 +115,13 @@ struct Session {
 class Worker {
 public:
     Worker(int listen_fd, const std::string& docroot) : listen_fd_(listen_fd), docroot_(docroot) {
-        if (io_uring_queue_init(kRingDepth, &ring_, 0) < 0) {
+        if (io_uring_queue_init(kRingDepth, &ring_,
+                                IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN) < 0) {
             std::perror("io_uring_queue_init");
+            std::exit(1);
+        }
+        if (io_uring_register_files_sparse(&ring_, kMaxSlots) < 0) {
+            std::perror("io_uring_register_files_sparse");
             std::exit(1);
         }
         int err = 0;
@@ -168,7 +172,7 @@ private:
 
     void submit_accept() {
         io_uring_sqe* sqe = get_sqe();
-        io_uring_prep_multishot_accept(sqe, listen_fd_, nullptr, nullptr, 0);
+        io_uring_prep_multishot_accept_direct(sqe, listen_fd_, nullptr, nullptr, 0);
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(nullptr, Op::Accept)));
     }
 
@@ -176,33 +180,33 @@ private:
     // (READ_MULTISHOT returns EINVAL on this kernel; RECV is the socket one.)
     void submit_read(Session& s) {
         io_uring_sqe* sqe = get_sqe();
-        io_uring_prep_recv_multishot(sqe, s.conn.fd(), nullptr, kBufSize, 0);
+        io_uring_prep_recv_multishot(sqe, s.slot, nullptr, kBufSize, 0);
+        sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
         sqe->buf_group = kBufGroupId;
-        sqe->flags |= IOSQE_BUFFER_SELECT;
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(&s, Op::Read)));
     }
 
     void submit_write(Session& s) {
         io_uring_sqe* sqe = get_sqe();
-        io_uring_prep_write(sqe, s.conn.fd(), s.write_buf.data() + s.write_pos,
+        io_uring_prep_write(sqe, s.slot, s.write_buf.data() + s.write_pos,
                             s.write_buf.size() - s.write_pos, 0);
+        sqe->flags |= IOSQE_FIXED_FILE;
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(tag(&s, Op::Write)));
     }
 
     // the read multishot must die before the session does: link a cancel in
     // front of the close so its last cqe lands while the session is alive
     void submit_close(Session& s) {
-        int fd = s.conn.release();
         io_uring_sqe* cancel = get_sqe();
         io_uring_prep_cancel(cancel, reinterpret_cast<void*>(tag(&s, Op::Read)), 0);
         io_uring_sqe_set_data(cancel, reinterpret_cast<void*>(tag(&s, Op::Cancel)));
         cancel->flags |= IOSQE_IO_LINK;
         io_uring_sqe* close = get_sqe();
-        io_uring_prep_close(close, fd);
+        io_uring_prep_close_direct(close, s.slot);
         io_uring_sqe_set_data(close, reinterpret_cast<void*>(tag(&s, Op::Close)));
     }
 
-    void drop(Session& s) { sessions_.erase(s.fd_no); }
+    void drop(Session& s) { sessions_.erase(s.slot); }
 
     void handle(const io_uring_cqe* cqe) {
         auto bits = reinterpret_cast<std::uintptr_t>(io_uring_cqe_get_data(cqe));
@@ -226,17 +230,16 @@ private:
     }
 
     // no F_MORE means the multishot ended; re-arm only then
-    void on_accept(int fd, unsigned flags) {
-        if (fd < 0) {
+    void on_accept(int slot, unsigned flags) {
+        if (slot < 0) {
             if (!(flags & IORING_CQE_F_MORE)) submit_accept();
             return;
         }
 
         auto s = std::make_unique<Session>();
-        s->conn = Connection{fd};
-        s->fd_no = fd;
+        s->slot = slot;
         Session* raw = s.get();
-        sessions_[fd] = std::move(s);
+        sessions_[slot] = std::move(s);
         submit_read(*raw);
     }
 

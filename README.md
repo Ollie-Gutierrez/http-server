@@ -13,6 +13,7 @@ Small HTTP/1.1 server in C++ for Linux.
 | epoll, one loop per core | 80k | 410k |
 | faster parsing and response building | 81k | 405k |
 | io_uring | 82k | 412k |
+| io_uring end to end | 84k | 417k |
 
 Measured with wrk over loopback, 10 second runs.
 
