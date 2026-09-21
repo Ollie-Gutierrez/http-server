@@ -108,6 +108,7 @@ struct Session {
     bool write_in_flight = false;  // a write op holds pointers into write_buf
     bool saw_eof = false;          // peer closed / multishot read ended
     bool want_close = false;
+    bool closing = false;  // close submitted; stray reads land after
 };
 
 // one ring per thread; unique_ptr sessions keep user_data pointers valid
@@ -197,6 +198,7 @@ private:
     // the read multishot must die before the session does: link a cancel in
     // front of the close so its last cqe lands while the session is alive
     void submit_close(Session& s) {
+        s.closing = true;
         io_uring_sqe* cancel = get_sqe();
         io_uring_prep_cancel(cancel, reinterpret_cast<void*>(tag(&s, Op::Read)), 0);
         io_uring_sqe_set_data(cancel, reinterpret_cast<void*>(tag(&s, Op::Cancel)));
@@ -265,6 +267,7 @@ private:
     }
 
     void process_buffered(Session& s) {
+        if (s.closing) return;
         bool keep_alive = true;
         while (true) {
             ParseResult pr = parse_request(s.read_buf);
@@ -305,8 +308,9 @@ private:
     }
 
     void on_write(Session& s, int n) {
-        if (n <= 0) {
-            drop(s);
+        if (n <= 0) {  // error: still close through the ring, or the fixed slot leaks
+            s.want_close = true;
+            submit_close(s);
             return;
         }
         s.write_pos += static_cast<std::size_t>(n);
