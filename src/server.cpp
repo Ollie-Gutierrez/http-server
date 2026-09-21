@@ -255,7 +255,15 @@ private:
         long n = cqe->res;
         if (n > 0 && (cqe->flags & IORING_CQE_F_BUFFER)) {
             unsigned bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-            s.read_buf.append(&pool_[std::size_t{bid} * kBufSize], static_cast<std::size_t>(n));
+            std::string_view incoming(&pool_[std::size_t{bid} * kBufSize],
+                                      static_cast<std::size_t>(n));
+            // the empty-buffer fast path parses straight off the pool view;
+            // otherwise fall back to stashing in read_buf like before
+            if (s.write_in_flight || s.closing || !s.read_buf.empty()) {
+                s.read_buf.append(incoming);
+            } else {
+                process_fresh(s, incoming);
+            }
             return_buffer(bid);
         }
         // no F_MORE means the multishot ended; no more reads will arrive
@@ -266,15 +274,17 @@ private:
         if (!s.write_in_flight) process_buffered(s);
     }
 
-    void process_buffered(Session& s) {
-        if (s.closing) return;
-        bool keep_alive = true;
+    // parses as many complete requests as fit in data, serializes the
+    // responses; returns keep-alive and reports bytes consumed
+    bool drain(Session& s, std::string_view data, std::size_t& consumed) {
         ParseResult pr;  // reused across the loop; skips the 1K header zero-init
+        consumed = 0;
         while (true) {
-            parse_request_into(s.read_buf, pr);
+            parse_request_into(data, pr);
             if (!pr.complete) break;
 
             HttpResponse resp;
+            bool keep_alive = true;
             if (pr.malformed) {
                 resp.status = 400;
                 resp.reason = "Bad Request";
@@ -285,10 +295,14 @@ private:
                 resp = handle_request(pr.request, docroot_);
             }
             resp.serialize_into(s.write_buf, keep_alive);
-            s.read_buf.erase(0, pr.consumed);
-            if (!keep_alive) break;
+            data.remove_prefix(pr.consumed);
+            consumed += pr.consumed;
+            if (!keep_alive) return false;
         }
+        return true;
+    }
 
+    void finish(Session& s, bool keep_alive) {
         if (s.read_buf.size() > kMaxReadBuf) {
             HttpResponse resp;
             resp.status = 400;
@@ -306,6 +320,23 @@ private:
             submit_close(s);
         }
         // otherwise: idle; the read multishot keeps delivering
+    }
+
+    // delivery with nothing pending: no copies, parse the pool view in place
+    void process_fresh(Session& s, std::string_view incoming) {
+        std::size_t consumed = 0;
+        bool keep_alive = drain(s, incoming, consumed);
+        if (keep_alive && consumed < incoming.size())
+            s.read_buf.append(incoming.substr(consumed));  // partial request tail
+        finish(s, keep_alive);
+    }
+
+    void process_buffered(Session& s) {
+        if (s.closing) return;
+        std::size_t consumed = 0;
+        bool keep_alive = drain(s, s.read_buf, consumed);
+        if (consumed) s.read_buf.erase(0, consumed);
+        finish(s, keep_alive);
     }
 
     void on_write(Session& s, int n) {
