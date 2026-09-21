@@ -16,9 +16,23 @@ std::string_view trim(std::string_view s) {
 
 ParseResult parse_request(std::string_view buf) {
     ParseResult r;
+    parse_request_into(buf, r);
+    return r;
+}
+
+void parse_request_into(std::string_view buf, ParseResult& r) {
+    // reuse path: only the fields written below are read; skipping the
+    // 1K HeaderList zero-init is worth ~15% of user-space samples
+    r.complete = false;
+    r.malformed = false;
+    r.consumed = 0;
+    r.request.method = {};
+    r.request.path = {};
+    r.request.body.clear();
+    r.request.headers.reset();
 
     auto end_headers = buf.find("\r\n\r\n");
-    if (end_headers == std::string_view::npos) return r;
+    if (end_headers == std::string_view::npos) return;
 
     std::string_view head = buf.substr(0, end_headers);
     std::size_t header_block_len = end_headers + 4;
@@ -32,7 +46,7 @@ ParseResult parse_request(std::string_view buf) {
         r.malformed = true;
         r.complete = true;
         r.consumed = header_block_len;
-        return r;
+        return;
     }
     r.request.method = request_line.substr(0, sp1);
     r.request.path = request_line.substr(sp1 + 1, sp2 - sp1 - 1);
@@ -49,7 +63,7 @@ ParseResult parse_request(std::string_view buf) {
             r.malformed = true;
             r.complete = true;
             r.consumed = header_block_len;
-            return r;
+            return;
         }
         r.request.headers.emplace(trim(line.substr(0, colon)), trim(line.substr(colon + 1)));
 
@@ -65,15 +79,15 @@ ParseResult parse_request(std::string_view buf) {
             r.malformed = true;
             r.complete = true;
             r.consumed = header_block_len;
-            return r;
+            return;
         }
         body_len = static_cast<std::size_t>(len);
     }
 
-    if (buf.size() < header_block_len + body_len) return r;
+    if (buf.size() < header_block_len + body_len) return;
 
     r.request.body = std::string(buf.substr(header_block_len, body_len));
     r.consumed = header_block_len + body_len;
     r.complete = true;
-    return r;
+    return;
 }

@@ -269,8 +269,9 @@ private:
     void process_buffered(Session& s) {
         if (s.closing) return;
         bool keep_alive = true;
+        ParseResult pr;  // reused across the loop; skips the 1K header zero-init
         while (true) {
-            ParseResult pr = parse_request(s.read_buf);
+            parse_request_into(s.read_buf, pr);
             if (!pr.complete) break;
 
             HttpResponse resp;

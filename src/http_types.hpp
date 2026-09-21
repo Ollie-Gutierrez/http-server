@@ -53,6 +53,7 @@ public:
     }
 
     std::size_t size() const noexcept { return n_; }
+    void reset() noexcept { n_ = 0; }
     const HeaderField* begin() const noexcept { return items_.data(); }
     const HeaderField* end() const noexcept { return items_.data() + n_; }
 

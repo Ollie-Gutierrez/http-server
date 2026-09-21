@@ -14,3 +14,4 @@ struct ParseResult {
 };
 
 ParseResult parse_request(std::string_view buf);
+void parse_request_into(std::string_view buf, ParseResult& r);
