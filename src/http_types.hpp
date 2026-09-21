@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
-#include <utility>
 
 namespace http {
 
@@ -54,8 +53,6 @@ public:
 
     std::size_t size() const noexcept { return n_; }
     void reset() noexcept { n_ = 0; }
-    const HeaderField* begin() const noexcept { return items_.data(); }
-    const HeaderField* end() const noexcept { return items_.data() + n_; }
 
 private:
     std::array<HeaderField, kMax> items_;
@@ -98,3 +95,11 @@ struct HttpResponse {
         out += body;
     }
 };
+
+inline HttpResponse make_error(int status, const char* reason, const char* body) {
+    HttpResponse r;
+    r.status = status;
+    r.reason = reason;
+    r.body = body;
+    return r;
+}

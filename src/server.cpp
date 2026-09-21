@@ -49,43 +49,25 @@ std::string_view content_type_for(std::string_view path) {
 }
 
 HttpResponse handle_request(const HttpRequest& req, const std::string& docroot) {
-    HttpResponse resp;
+    if (req.method != "GET") return make_error(405, "Method Not Allowed", "405 method not allowed");
 
-    if (req.method != "GET") {
-        resp.status = 405;
-        resp.reason = "Method Not Allowed";
-        resp.body = "405 method not allowed";
-        return resp;
-    }
-
-    if (req.path.find("..") != std::string_view::npos) {
-        resp.status = 400;
-        resp.reason = "Bad Request";
-        resp.body = "400 bad request";
-        return resp;
-    }
+    if (req.path.find("..") != std::string_view::npos)
+        return make_error(400, "Bad Request", "400 bad request");
 
     if (req.path == "/hello") {
-        resp.status = 200;
-        resp.reason = "OK";
+        HttpResponse resp;  // defaults: 200 OK, text/plain
         resp.body = "hello";
         return resp;
     }
-
     std::filesystem::path fp =
         std::filesystem::path(docroot) / (req.path == "/" ? "index.html" : req.path.substr(1));
     std::error_code ec;
-    if (!std::filesystem::is_regular_file(fp, ec)) {
-        resp.status = 404;
-        resp.reason = "Not Found";
-        resp.body = "404 not found";
-        return resp;
-    }
+    if (!std::filesystem::is_regular_file(fp, ec))
+        return make_error(404, "Not Found", "404 not found");
 
     std::ifstream in(fp, std::ios::binary);
     std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    resp.status = 200;
-    resp.reason = "OK";
+    HttpResponse resp;
     resp.content_type = std::string(content_type_for(fp.string()));
     resp.body = std::move(body);
     return resp;
@@ -286,9 +268,7 @@ private:
             HttpResponse resp;
             bool keep_alive = true;
             if (pr.malformed) {
-                resp.status = 400;
-                resp.reason = "Bad Request";
-                resp.body = "400 bad request";
+                resp = make_error(400, "Bad Request", "400 bad request");
                 keep_alive = false;
             } else {
                 keep_alive = !http::icontains(pr.request.header("connection"), "close");
@@ -304,11 +284,7 @@ private:
 
     void finish(Session& s, bool keep_alive) {
         if (s.read_buf.size() > kMaxReadBuf) {
-            HttpResponse resp;
-            resp.status = 400;
-            resp.reason = "Bad Request";
-            resp.body = "400 bad request";
-            resp.serialize_into(s.write_buf, false);
+            make_error(400, "Bad Request", "400 bad request").serialize_into(s.write_buf, false);
             keep_alive = false;
         }
 
