@@ -13,6 +13,10 @@
           pkg-config
           (gtest.override { stdenv = pkgs.libcxxStdenv; })
           liburing
+          libbpf
+          bpftools
+          libelf
+          iproute2
           wrk
           perf
           curl
